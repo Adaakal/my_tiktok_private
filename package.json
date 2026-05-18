@@ -5,5 +5,8 @@
   "scripts": {
     "preview-videos": "node scripts/tiktok-make-videos-private.js",
     "list-videos": "node scripts/tiktok-make-videos-private.js --preview"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
   }
 }
