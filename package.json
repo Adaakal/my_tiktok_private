@@ -1,0 +1,9 @@
+{
+  "name": "my_tiktok_private",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "preview-videos": "node scripts/tiktok-make-videos-private.js",
+    "list-videos": "node scripts/tiktok-make-videos-private.js --preview"
+  }
+}

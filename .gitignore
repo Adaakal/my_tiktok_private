@@ -1,0 +1,5 @@
+node_modules/
+.tiktok-storage.json
+.DS_Store
+.env
+.env.local
