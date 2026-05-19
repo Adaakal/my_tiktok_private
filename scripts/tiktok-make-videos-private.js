@@ -166,7 +166,32 @@ async function changeVideoToPrivate(page, videoUrl) {
 
   await page.waitForTimeout(2000);
 
-  // Wait for privacy settings to appear
+  // Wait for modal/popup/dialog to appear
+  const modalSelectors = [
+    '[role="dialog"]',
+    'div[class*="modal"]',
+    'div[class*="popup"]',
+    'div[class*="overlay"]',
+    'div[role="presentation"]',
+  ];
+
+  let modalAppeared = false;
+  for (const selector of modalSelectors) {
+    try {
+      await page.waitForSelector(selector, { timeout: 3000, state: 'visible' });
+      console.log(`  Modal appeared: ${selector}`);
+      modalAppeared = true;
+      break;
+    } catch (e) {
+      // Continue to next selector
+    }
+  }
+
+  if (modalAppeared) {
+    await page.waitForTimeout(800);
+  }
+
+  // Wait for privacy settings to appear in the popup
   const privacyOptionSelectors = [
     'div:has-text("Only you")',
     'button:has-text("Only you")',
@@ -178,6 +203,8 @@ async function changeVideoToPrivate(page, videoUrl) {
   let selectedPrivate = false;
   for (const selector of privacyOptionSelectors) {
     try {
+      // Wait longer for privacy option to appear
+      await page.waitForSelector(selector, { timeout: 5000, state: 'attached' });
       const element = await page.$(selector);
       if (element) {
         console.log(`  Found "Only you" option with selector: ${selector}`);
@@ -191,9 +218,16 @@ async function changeVideoToPrivate(page, videoUrl) {
   }
 
   if (!selectedPrivate) {
-    console.warn('  Unable to find or select "Only you" privacy option. Dumping page title and URL.');
+    console.warn('  Unable to find or select "Only you" privacy option.');
     console.warn(`    Current URL: ${page.url()}`);
     console.warn(`    Page title: ${await page.title()}`);
+    // Try to capture the modal content
+    try {
+      const modalContent = await page.innerHTML('[role="dialog"]') || 'No dialog found';
+      console.warn(`    Modal snippet: ${modalContent.substring(0, 200)}`);
+    } catch (e) {
+      console.warn('    Could not read modal content');
+    }
     return false;
   }
 
