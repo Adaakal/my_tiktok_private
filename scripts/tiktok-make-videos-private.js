@@ -109,10 +109,12 @@ async function changeVideoToPrivate(page, videoUrl) {
   await page.goto(videoUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(2000);
 
-  // Try to find the menu button (three dots icon or similar)
-  const menuSelectors = [
+  // Try actions that reveal the privacy dialog.
+  const actionSelectors = [
+    'button:has-text("Edit")',
+    'button:has-text("More actions")',
     'button[aria-label*="More"]',
-    'button[role="button"][aria-label*="menu"]',
+    'button[aria-label*="more"]',
     'button:has-text("...")',
     'button[class*="menu"]',
     '[data-testid="more-button"]',
@@ -120,43 +122,14 @@ async function changeVideoToPrivate(page, videoUrl) {
     'div[role="button"]:has-text("...")',
   ];
 
-  let menuOpened = false;
-  for (const selector of menuSelectors) {
+  let actionClicked = false;
+  for (const selector of actionSelectors) {
     try {
       const element = await page.$(selector);
       if (element) {
-        console.log(`  Found menu with selector: ${selector}`);
-        await element.click();
-        menuOpened = true;
-        break;
-      }
-    } catch (e) {
-      // Continue to next selector
-    }
-  }
-
-  if (!menuOpened) {
-    console.warn('  Unable to locate menu button. Trying direct privacy access...');
-  } else {
-    await page.waitForTimeout(800);
-  }
-
-  // Look for edit/settings option in the menu
-  const editOptionSelectors = [
-    'button:has-text("Edit")',
-    'div:has-text("Edit video")',
-    'button[aria-label*="Edit"]',
-    'a:has-text("Edit")',
-  ];
-
-  let foundEditOption = false;
-  for (const selector of editOptionSelectors) {
-    try {
-      const element = await page.$(selector);
-      if (element) {
-        console.log(`  Found edit option with selector: ${selector}`);
-        await element.click();
-        foundEditOption = true;
+        console.log(`  Clicking action selector: ${selector}`);
+        await element.click({ force: true });
+        actionClicked = true;
         break;
       }
     } catch (e) {
@@ -164,76 +137,92 @@ async function changeVideoToPrivate(page, videoUrl) {
     }
   }
 
-  await page.waitForTimeout(2000);
-
-  // Wait for modal/popup/dialog to appear
-  const modalSelectors = [
-    '[role="dialog"]',
-    'div[class*="modal"]',
-    'div[class*="popup"]',
-    'div[class*="overlay"]',
-    'div[role="presentation"]',
-  ];
-
-  let modalAppeared = false;
-  for (const selector of modalSelectors) {
-    try {
-      await page.waitForSelector(selector, { timeout: 3000, state: 'visible' });
-      console.log(`  Modal appeared: ${selector}`);
-      modalAppeared = true;
-      break;
-    } catch (e) {
-      // Continue to next selector
-    }
+  if (!actionClicked) {
+    console.warn('  Could not click any action selector. Searching for direct privacy dialog text.');
   }
 
-  if (modalAppeared) {
-    await page.waitForTimeout(800);
+  await page.waitForTimeout(1500);
+
+  const popup = await page.evaluateHandle(() => {
+    const dialogTexts = ['Privacy settings', 'Who can watch this video', 'Only you', 'Only me'];
+    const elements = Array.from(document.querySelectorAll('div'));
+    return elements.find((el) => {
+      const text = el.innerText || '';
+      return dialogTexts.some((phrase) => text.includes(phrase));
+    }) || null;
+  });
+
+  const popupVisible = popup && (await (await popup.getProperty('nodeType')).jsonValue()) === 1;
+
+  if (popupVisible) {
+    console.log('  Found popup container by text content.');
+  } else {
+    console.warn('  Could not locate a popup container by text. Falling back to page-wide selectors.');
   }
 
-  // Wait for privacy settings to appear in the popup
-  const privacyOptionSelectors = [
-    'div:has-text("Only you")',
+  const optionSelectors = [
     'button:has-text("Only you")',
-    'label:has-text("Only you")',
     'span:has-text("Only you")',
-    '[role="option"]:has-text("Only you")',
+    'div:has-text("Only you")',
+    'button:has-text("Only me")',
+    'span:has-text("Only me")',
+    'div:has-text("Only me")',
+    'text="Only you"',
+    'text="Only me"',
   ];
 
   let selectedPrivate = false;
-  for (const selector of privacyOptionSelectors) {
-    try {
-      // Wait longer for privacy option to appear
-      await page.waitForSelector(selector, { timeout: 5000, state: 'attached' });
-      const element = await page.$(selector);
-      if (element) {
-        console.log(`  Found "Only you" option with selector: ${selector}`);
-        await element.click();
-        selectedPrivate = true;
-        break;
+
+  if (popupVisible) {
+    for (const selector of optionSelectors) {
+      try {
+        const handle = await popup.$(selector);
+        if (handle) {
+          console.log(`  Clicking privacy option inside popup: ${selector}`);
+          await handle.click({ force: true });
+          selectedPrivate = true;
+          break;
+        }
+      } catch (e) {
+        // Continue
       }
-    } catch (e) {
-      // Continue
     }
   }
 
   if (!selectedPrivate) {
-    console.warn('  Unable to find or select "Only you" privacy option.');
+    for (const selector of optionSelectors) {
+      try {
+        const element = await page.$(selector);
+        if (element) {
+          console.log(`  Clicking privacy option page-wide: ${selector}`);
+          await element.click({ force: true });
+          selectedPrivate = true;
+          break;
+        }
+      } catch (e) {
+        // Continue
+      }
+    }
+  }
+
+  if (!selectedPrivate) {
+    console.warn('  Unable to find or click "Only you" / "Only me".');
     console.warn(`    Current URL: ${page.url()}`);
     console.warn(`    Page title: ${await page.title()}`);
-    // Try to capture the modal content
     try {
-      const modalContent = await page.innerHTML('[role="dialog"]') || 'No dialog found';
-      console.warn(`    Modal snippet: ${modalContent.substring(0, 200)}`);
+      const snippet = await page.evaluate(() => {
+        const dialog = Array.from(document.querySelectorAll('div')).find((el) => /Privacy settings|Who can watch this video/i.test(el.innerText || ''));
+        return dialog ? dialog.innerText.slice(0, 300) : 'no matching dialog text found';
+      });
+      console.warn(`    Dialog snippet: ${snippet}`);
     } catch (e) {
-      console.warn('    Could not read modal content');
+      console.warn('    Could not extract dialog snippet.');
     }
     return false;
   }
 
   await page.waitForTimeout(1000);
 
-  // Click save/done button
   const confirmSelectors = [
     'button:has-text("Done")',
     'button:has-text("Save")',
@@ -246,8 +235,8 @@ async function changeVideoToPrivate(page, videoUrl) {
     try {
       const element = await page.$(selector);
       if (element) {
-        console.log(`  Clicking confirmation button with selector: ${selector}`);
-        await element.click();
+        console.log(`  Clicking confirmation button: ${selector}`);
+        await element.click({ force: true });
         confirmed = true;
         break;
       }
@@ -257,7 +246,7 @@ async function changeVideoToPrivate(page, videoUrl) {
   }
 
   if (!confirmed) {
-    console.warn('  No confirmation button found. Changes may have auto-saved.');
+    console.warn('  No confirmation button found; the setting may auto-save.');
   }
 
   await page.waitForTimeout(DELAY_MS);
