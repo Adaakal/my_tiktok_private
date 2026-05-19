@@ -5,6 +5,8 @@ const readline = require('readline');
 const { chromium } = require('playwright');
 
 const STORAGE_STATE_PATH = path.resolve(__dirname, '..', '.tiktok-storage.json');
+const USER_DATA_DIR = path.resolve(__dirname, '..', '.tiktok-browser');
+const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const USERNAME = process.argv[2];
 const MAX_VIDEOS = Number(getArgValue('--max') || '0');
 const DELAY_MS = Number(getArgValue('--delay') || '4500');
@@ -58,18 +60,28 @@ async function ensureSession(page, context) {
 }
 
 async function collectVideoUrls(page) {
-  const profileUrl = `https://www.tiktok.com/@${USERNAME}`;
-  console.log(`Navigating to profile: ${profileUrl}`);
-  await page.goto(profileUrl, { waitUntil: 'networkidle' });
+  const profileUrl = `https://www.tiktok.com/@${USERNAME}/video`;
+  console.log(`Navigating to profile videos: ${profileUrl}`);
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2500);
 
-  await page.waitForSelector('a[href*="/video/"]', { timeout: 30000 });
+  const profileVideoLinkSelector = `a[href*="/@${USERNAME}/video/"]`;
+  await page.waitForSelector(profileVideoLinkSelector, { timeout: 60000, state: 'attached' });
 
   const urls = new Set();
   let lastHeight = 0;
 
   while (urls.size < 200) {
-    const newUrls = await page.$$eval('a[href*="/video/"]', (anchors) =>
-      anchors.map((anchor) => anchor.href).filter(Boolean),
+    const newUrls = await page.$$eval(profileVideoLinkSelector, (anchors) =>
+      anchors
+        .map((anchor) => {
+          try {
+            return new URL(anchor.href, window.location.origin).href;
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean),
     );
     newUrls.forEach((href) => urls.add(href));
 
@@ -94,86 +106,139 @@ async function clickIfExists(page, selector, options = {}) {
 
 async function changeVideoToPrivate(page, videoUrl) {
   console.log(`\nProcessing ${videoUrl}`);
-  await page.goto(videoUrl, { waitUntil: 'networkidle' });
+  await page.goto(videoUrl, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2000);
 
-  // The TikTok edit UI can vary, so this tries several paths.
-  const editSelectors = [
+  // Try to find the menu button (three dots icon or similar)
+  const menuSelectors = [
+    'button[aria-label*="More"]',
+    'button[role="button"][aria-label*="menu"]',
+    'button:has-text("...")',
+    'button[class*="menu"]',
+    '[data-testid="more-button"]',
+    'button[data-testid*="more"]',
+    'div[role="button"]:has-text("...")',
+  ];
+
+  let menuOpened = false;
+  for (const selector of menuSelectors) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        console.log(`  Found menu with selector: ${selector}`);
+        await element.click();
+        menuOpened = true;
+        break;
+      }
+    } catch (e) {
+      // Continue to next selector
+    }
+  }
+
+  if (!menuOpened) {
+    console.warn('  Unable to locate menu button. Trying direct privacy access...');
+  } else {
+    await page.waitForTimeout(800);
+  }
+
+  // Look for edit/settings option in the menu
+  const editOptionSelectors = [
     'button:has-text("Edit")',
-    'button:has-text("Manage")',
-    '[aria-label="Edit"]',
     'div:has-text("Edit video")',
-    'button:has-text("More actions")',
+    'button[aria-label*="Edit"]',
+    'a:has-text("Edit")',
   ];
 
-  let opened = false;
-  for (const selector of editSelectors) {
-    const element = await page.$(selector);
-    if (element) {
-      await element.click();
-      opened = true;
-      break;
+  let foundEditOption = false;
+  for (const selector of editOptionSelectors) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        console.log(`  Found edit option with selector: ${selector}`);
+        await element.click();
+        foundEditOption = true;
+        break;
+      }
+    } catch (e) {
+      // Continue
     }
   }
 
-  if (!opened) {
-    console.warn('Unable to open edit menu for this video. The page structure may have changed.');
-    return false;
-  }
+  await page.waitForTimeout(2000);
 
-  await page.waitForTimeout(1200);
-
-  const onlyYouSelectors = [
-    'text=Only you',
+  // Wait for privacy settings to appear
+  const privacyOptionSelectors = [
+    'div:has-text("Only you")',
     'button:has-text("Only you")',
+    'label:has-text("Only you")',
     'span:has-text("Only you")',
-    'li:has-text("Only you")',
+    '[role="option"]:has-text("Only you")',
   ];
 
-  let selectedOnlyYou = false;
-  for (const selector of onlyYouSelectors) {
-    const element = await page.$(selector);
-    if (element) {
-      await element.click();
-      selectedOnlyYou = true;
-      break;
+  let selectedPrivate = false;
+  for (const selector of privacyOptionSelectors) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        console.log(`  Found "Only you" option with selector: ${selector}`);
+        await element.click();
+        selectedPrivate = true;
+        break;
+      }
+    } catch (e) {
+      // Continue
     }
   }
 
-  if (!selectedOnlyYou) {
-    console.warn('Unable to select "Only you". The privacy dialog may be different for your account.');
+  if (!selectedPrivate) {
+    console.warn('  Unable to find or select "Only you" privacy option. Dumping page title and URL.');
+    console.warn(`    Current URL: ${page.url()}`);
+    console.warn(`    Page title: ${await page.title()}`);
     return false;
   }
 
-  const doneSelectors = [
+  await page.waitForTimeout(1000);
+
+  // Click save/done button
+  const confirmSelectors = [
     'button:has-text("Done")',
     'button:has-text("Save")',
-    'button:has-text("Publish")',
     'button:has-text("Confirm")',
+    'button:has-text("Submit")',
   ];
 
-  let saved = false;
-  for (const selector of doneSelectors) {
-    const element = await page.$(selector);
-    if (element) {
-      await element.click();
-      saved = true;
-      break;
+  let confirmed = false;
+  for (const selector of confirmSelectors) {
+    try {
+      const element = await page.$(selector);
+      if (element) {
+        console.log(`  Clicking confirmation button with selector: ${selector}`);
+        await element.click();
+        confirmed = true;
+        break;
+      }
+    } catch (e) {
+      // Continue
     }
   }
 
-  if (!saved) {
-    console.warn('Could not find a save/confirm button after selecting Private.');
-    return false;
+  if (!confirmed) {
+    console.warn('  No confirmation button found. Changes may have auto-saved.');
   }
 
   await page.waitForTimeout(DELAY_MS);
-  console.log('Privacy set to Private for this video (or attempted).');
+  console.log('  ✓ Privacy update attempted for this video.');
   return true;
 }
 
 (async () => {
-  const browser = await chromium.launch({ headless: false });
-  const context = await browser.newContext({ storageState: fs.existsSync(STORAGE_STATE_PATH) ? STORAGE_STATE_PATH : undefined });
+  const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+    headless: false,
+    viewport: { width: 1280, height: 900 },
+    userAgent: USER_AGENT,
+    args: ['--disable-blink-features=AutomationControlled'],
+    ignoreDefaultArgs: ['--enable-automation'],
+  });
   const page = await context.newPage();
 
   try {
@@ -207,6 +272,6 @@ async function changeVideoToPrivate(page, videoUrl) {
   } catch (error) {
     console.error('Error:', error);
   } finally {
-    await browser.close();
+    await context.close();
   }
 })();
