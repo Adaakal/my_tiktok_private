@@ -10,8 +10,27 @@ SETUP (run once):
 
 USAGE:
   python tiktok_make_private.py <username> [--preview] [--max=10] [--delay=4500]
+  python tiktok_make_private.py <username> --attach          # attach to open Chrome
+  python tiktok_make_private.py <username> --chrome          # launch system Chrome
+
+RECOMMENDED — ATTACH TO YOUR OPEN CHROME (avoids bot detection):
+  Step 1: Quit Chrome completely (Cmd+Q).
+  Step 2: Relaunch it with remote debugging on:
+    open -a "Google Chrome" --args --remote-debugging-port=9222
+  Step 3: Log into TikTok in that Chrome window as normal.
+  Step 4: Run:
+    python tiktok_make_private.py adaugo_ezenwanyi --attach
+
+  This reuses your real session, cookies, and browser fingerprint — TikTok
+  cannot distinguish it from normal human browsing.
 
 EXAMPLES:
+  # Attach to already-open Chrome (best for avoiding bot detection)
+  python tiktok_make_private.py adaugo_ezenwanyi --attach
+
+  # Launch system Chrome instead of Playwright's Chromium
+  python tiktok_make_private.py adaugo_ezenwanyi --chrome
+
   # Preview mode (see what will change without making changes)
   python tiktok_make_private.py adaugo_ezenwanyi --preview
 
@@ -84,43 +103,58 @@ Examples:
         default=DEFAULT_DELAY_MS,
         help=f"Wait time between videos in milliseconds (default: {DEFAULT_DELAY_MS})"
     )
+    parser.add_argument(
+        "--attach",
+        action="store_true",
+        help=(
+            "Attach to an already-running Chrome with --remote-debugging-port=9222. "
+            "Best for avoiding bot detection — reuses your real session and cookies. "
+            "Launch Chrome first with: "
+            "open -a 'Google Chrome' --args --remote-debugging-port=9222"
+        )
+    )
+    parser.add_argument(
+        "--cdp-port",
+        type=int,
+        default=9222,
+        help="CDP port to attach to (default: 9222, only used with --attach)"
+    )
+    parser.add_argument(
+        "--chrome",
+        action="store_true",
+        help="Launch system Google Chrome instead of Playwright's bundled Chromium"
+    )
     return parser.parse_args()
 
 
 async def wait_for_manual_login(page: Page, context: BrowserContext):
-    """Pause and ask user to log in manually, then save session."""
-    print("\n⚠️  You need to log in to TikTok.")
-    print("   The browser window is open — please log in manually.")
-    print("   When you are fully logged in, return here and press ENTER.")
-    input("Press ENTER when logged in... ")
+    """Open a blank browser and wait for the user to log in manually."""
+    print("\n" + "=" * 70)
+    print("🌐  Browser is open in incognito mode.")
+    print()
+    print("   Please do the following in the browser window:")
+    print("   1. Go to https://www.tiktok.com")
+    print("   2. Log into your TikTok account manually")
+    print("   3. Make sure you can see your profile/feed")
+    print()
+    print("   When you are fully logged in, come back here and press ENTER.")
+    print("=" * 70)
+    input("\nPress ENTER when logged in... ")
 
-    # Save the session state
+    # Save the session so we don't need to log in again next time
     await context.storage_state(path=str(STORAGE_STATE_PATH))
-    print(f"✅ Session saved to {STORAGE_STATE_PATH}")
+    print(f"✅ Session saved for next time.")
 
 
 async def ensure_session(page: Page, context: BrowserContext, username: str):
     """
-    Check if user is logged in. If not, prompt for manual login.
-    Uses saved session state if available.
+    Always prompt for manual login — opens an incognito browser and waits
+    for the user to navigate to TikTok and log in themselves.
     """
-    if not STORAGE_STATE_PATH.exists():
-        print("No saved session found. Opening login page...")
-        await page.goto("https://www.tiktok.com/login", wait_until="networkidle", timeout=30000)
-        await wait_for_manual_login(page, context)
-        return
-
-    # Test if saved session is still valid
-    await page.goto("https://www.tiktok.com/", wait_until="networkidle", timeout=30000)
-
-    # Check if profile link exists (indicates logged in)
-    profile_link = await page.query_selector(f'a[href*="/@{username}"]')
-
-    if not profile_link:
-        print("⚠️  Saved session expired. Logging in again...")
-        STORAGE_STATE_PATH.unlink(missing_ok=True)
-        await page.goto("https://www.tiktok.com/login", wait_until="networkidle", timeout=30000)
-        await wait_for_manual_login(page, context)
+    print("\nOpening browser — please log in to TikTok manually...")
+    # Just open a blank page; user navigates themselves
+    await page.goto("about:blank")
+    await wait_for_manual_login(page, context)
 
 
 async def collect_video_urls(page: Page, username: str, max_videos: int = 0) -> List[str]:
@@ -302,20 +336,70 @@ async def main():
     print("=" * 70)
 
     async with async_playwright() as p:
-        # Launch browser with saved session if available
-        storage_state = str(
-            STORAGE_STATE_PATH) if STORAGE_STATE_PATH.exists() else None
 
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context(
-            storage_state=storage_state,
-            viewport={"width": 1280, "height": 800}
-        )
-        page = await context.new_page()
+        if args.attach:
+            # ── Attach to already-running Chrome via CDP ──────────────────────
+            cdp_url = f"http://localhost:{args.cdp_port}"
+            print(f"\n🔗 Attaching to existing Chrome at {cdp_url} ...")
+            print("   (Make sure Chrome was launched with --remote-debugging-port="
+                  f"{args.cdp_port} and you're already logged into TikTok)\n")
+            try:
+                browser = await p.chromium.connect_over_cdp(cdp_url)
+            except Exception as e:
+                print(
+                    f"\n❌ Could not connect to Chrome on port {args.cdp_port}.")
+                print("   Start Chrome with remote debugging first:")
+                print(
+                    f"   open -a 'Google Chrome' --args --remote-debugging-port={args.cdp_port}")
+                print(f"\n   Error: {e}")
+                return
+
+            # Reuse the first existing context/page (your real session)
+            contexts = browser.contexts
+            if contexts:
+                context = contexts[0]
+                pages = context.pages
+                page = pages[0] if pages else await context.new_page()
+            else:
+                context = await browser.new_context(viewport={"width": 1280, "height": 800})
+                page = await context.new_page()
+
+            print("✅ Attached to Chrome — using your existing TikTok session.")
+
+        else:
+            # ── Launch a new browser (Chromium or system Chrome) ──────────────
+            storage_state = str(
+                STORAGE_STATE_PATH) if STORAGE_STATE_PATH.exists() else None
+
+            launch_kwargs = {"headless": False}
+
+            if args.chrome:
+                # Use system-installed Google Chrome on macOS
+                import shutil
+                chrome_path = (
+                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+                )
+                if not shutil.which(chrome_path) and not Path(chrome_path).exists():
+                    print("❌ Google Chrome not found at the default macOS path.")
+                    print(
+                        "   Install Chrome or run without --chrome to use Playwright's Chromium.")
+                    return
+                launch_kwargs["executable_path"] = chrome_path
+                print("🌐 Launching system Google Chrome...")
+            else:
+                print("🌐 Launching Playwright Chromium...")
+
+            browser = await p.chromium.launch(**launch_kwargs)
+            # Always start fresh — no saved cookies so TikTok sees a clean session
+            context = await browser.new_context(
+                viewport={"width": 1280, "height": 800}
+            )
+            page = await context.new_page()
 
         try:
-            # Ensure we're logged in
-            await ensure_session(page, context, args.username)
+            # Ensure we're logged in (skipped when attaching — already logged in)
+            if not args.attach:
+                await ensure_session(page, context, args.username)
 
             # Collect all video URLs
             video_urls = await collect_video_urls(page, args.username, args.max)
@@ -374,7 +458,9 @@ async def main():
             print(f"\n❌ Unexpected error: {e}")
             raise
         finally:
-            await browser.close()
+            # Don't close the browser when attaching — it's your real Chrome!
+            if not args.attach:
+                await browser.close()
 
 
 if __name__ == "__main__":

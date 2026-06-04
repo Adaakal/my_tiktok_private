@@ -33,8 +33,10 @@ async def main():
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False)
+        # Open in incognito/private mode (fresh context with no cached cookies)
         context = await browser.new_context(
-            viewport={"width": 1280, "height": 800}
+            viewport={"width": 1280, "height": 800},
+            ignore_https_errors=True  # Sometimes helps with TikTok
         )
         page = await context.new_page()
 
