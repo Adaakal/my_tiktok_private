@@ -66,6 +66,7 @@ from playwright.async_api import async_playwright, Page, BrowserContext
 
 # ── CONFIG ─────────────────────────────────────────────────────────────────────
 STORAGE_STATE_PATH = Path.home() / ".tiktok_privacy_manager_session.json"
+BROWSER_PROFILE_DIR = Path.home() / ".tiktok_browser_profile"
 DEFAULT_DELAY_MS = 4500  # 4.5 seconds between videos
 # ───────────────────────────────────────────────────────────────────────────────
 
@@ -127,34 +128,26 @@ Examples:
     return parser.parse_args()
 
 
-async def wait_for_manual_login(page: Page, context: BrowserContext):
-    """Open a blank browser and wait for the user to log in manually."""
-    print("\n" + "=" * 70)
-    print("🌐  Browser is open in incognito mode.")
-    print()
-    print("   Please do the following in the browser window:")
-    print("   1. Go to https://www.tiktok.com")
-    print("   2. Log into your TikTok account manually")
-    print("   3. Make sure you can see your profile/feed")
-    print()
-    print("   When you are fully logged in, come back here and press ENTER.")
-    print("=" * 70)
-    input("\nPress ENTER when logged in... ")
-
-    # Save the session so we don't need to log in again next time
-    await context.storage_state(path=str(STORAGE_STATE_PATH))
-    print(f"✅ Session saved for next time.")
-
-
-async def ensure_session(page: Page, context: BrowserContext, username: str):
+async def ensure_session(page: Page, username: str):
     """
-    Always prompt for manual login — opens an incognito browser and waits
-    for the user to navigate to TikTok and log in themselves.
+    Check if already logged in via the persistent profile.
+    If not, navigate to login page and wait for manual login.
     """
-    print("\nOpening browser — please log in to TikTok manually...")
-    # Just open a blank page; user navigates themselves
-    await page.goto("about:blank")
-    await wait_for_manual_login(page, context)
+    await page.goto("https://www.tiktok.com/", wait_until="networkidle", timeout=30000)
+    profile_link = await page.query_selector(f'a[href*="/@{username}"]')
+
+    if not profile_link:
+        print("\n" + "=" * 70)
+        print("🌐  Not logged in — TikTok login page is open.")
+        print()
+        print("   1. Log in with your username/password or phone number")
+        print("   2. Wait until you can see your feed/profile")
+        print("   3. Come back here and press ENTER")
+        print("=" * 70)
+        input("\nPress ENTER when fully logged in... ")
+        print("✅ Logged in — session saved in browser profile for next time.")
+    else:
+        print("✅ Already logged in via saved browser profile.")
 
 
 async def collect_video_urls(page: Page, username: str, max_videos: int = 0) -> List[str]:
@@ -166,11 +159,43 @@ async def collect_video_urls(page: Page, username: str, max_videos: int = 0) -> 
     print(f"\n→ Navigating to profile: {profile_url}")
     await page.goto(profile_url, wait_until="networkidle", timeout=30000)
 
-    # Wait for videos to load
-    try:
-        await page.wait_for_selector('a[href*="/video/"]', timeout=30000)
-    except Exception as e:
-        print(f"❌ Error: Could not find video links. Profile may be private or empty.")
+    # Give the page extra time to fully render (TikTok is JS-heavy)
+    await asyncio.sleep(4)
+
+    # Wait for videos to load — try multiple selectors
+    video_selector = None
+    selectors_to_try = [
+        'a[href*="/video/"]',
+        'div[data-e2e="user-post-item"] a',
+        '[data-e2e="user-post-item-list"] a',
+        '[class*="DivItemContainer"] a',
+        '[class*="video-feed"] a',
+        'div[class*="VideoFeed"] a',
+        'a[href*="/@"][href*="/video"]',
+    ]
+    for sel in selectors_to_try:
+        try:
+            await page.wait_for_selector(sel, timeout=8000)
+            video_selector = sel
+            print(f"  ✓ Found videos using selector: {sel}")
+            break
+        except Exception:
+            continue
+
+    if not video_selector:
+        title = await page.title()
+        url = page.url
+        # Grab all <a> hrefs on the page so we can find the right selector
+        all_hrefs = await page.eval_on_selector_all('a[href]', 'els => els.map(e => e.href).filter(h => h.includes("tiktok"))')
+        print(f"❌ Error: Could not find video links.")
+        print(f"   Page title: {title}")
+        print(f"   Page URL:   {url}")
+        if all_hrefs:
+            print(f"   Sample TikTok links found on page:")
+            for h in all_hrefs[:10]:
+                print(f"     {h}")
+        else:
+            print(f"   No TikTok links found — page may not have loaded correctly.")
         return []
 
     video_urls = set()
@@ -367,39 +392,29 @@ async def main():
             print("✅ Attached to Chrome — using your existing TikTok session.")
 
         else:
-            # ── Launch a new browser (Chromium or system Chrome) ──────────────
-            storage_state = str(
-                STORAGE_STATE_PATH) if STORAGE_STATE_PATH.exists() else None
+            # ── Launch with a persistent browser profile ──────────────────────
+            # A persistent profile stores cookies, localStorage, and fingerprint
+            # data between runs — TikTok sees it as a real returning browser,
+            # not a fresh automation instance.
+            BROWSER_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+            print(f"🌐 Launching Chromium with persistent profile...")
+            print(f"   Profile stored at: {BROWSER_PROFILE_DIR}")
 
-            launch_kwargs = {"headless": False}
-
-            if args.chrome:
-                # Use system-installed Google Chrome on macOS
-                import shutil
-                chrome_path = (
-                    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-                )
-                if not shutil.which(chrome_path) and not Path(chrome_path).exists():
-                    print("❌ Google Chrome not found at the default macOS path.")
-                    print(
-                        "   Install Chrome or run without --chrome to use Playwright's Chromium.")
-                    return
-                launch_kwargs["executable_path"] = chrome_path
-                print("🌐 Launching system Google Chrome...")
-            else:
-                print("🌐 Launching Playwright Chromium...")
-
-            browser = await p.chromium.launch(**launch_kwargs)
-            # Always start fresh — no saved cookies so TikTok sees a clean session
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 800}
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=str(BROWSER_PROFILE_DIR),
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
             )
-            page = await context.new_page()
+            # launch_persistent_context returns the context directly (no separate browser)
+            browser = None
+            page = context.pages[0] if context.pages else await context.new_page()
 
         try:
-            # Ensure we're logged in (skipped when attaching — already logged in)
+            # Ensure we're logged in
             if not args.attach:
-                await ensure_session(page, context, args.username)
+                await ensure_session(page, args.username)
 
             # Collect all video URLs
             video_urls = await collect_video_urls(page, args.username, args.max)
@@ -458,8 +473,11 @@ async def main():
             print(f"\n❌ Unexpected error: {e}")
             raise
         finally:
-            # Don't close the browser when attaching — it's your real Chrome!
-            if not args.attach:
+            if args.attach:
+                pass  # Don't close — it's your real Chrome
+            elif browser is None:
+                await context.close()  # persistent context — close the context
+            else:
                 await browser.close()
 
 
