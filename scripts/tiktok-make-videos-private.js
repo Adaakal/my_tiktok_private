@@ -62,11 +62,20 @@ async function ensureSession(page, context) {
 async function collectVideoUrls(page) {
   const profileUrl = `https://www.tiktok.com/@${USERNAME}/video`;
   console.log(`Navigating to profile videos: ${profileUrl}`);
-  await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2500);
+  await page.goto(profileUrl, { waitUntil: 'networkidle', timeout: 120000 });
+  await page.waitForTimeout(4000);
 
   const profileVideoLinkSelector = `a[href*="/@${USERNAME}/video/"]`;
-  await page.waitForSelector(profileVideoLinkSelector, { timeout: 60000, state: 'attached' });
+  const curUrl = page.url();
+  if (!curUrl.includes(`/@${USERNAME}/video`)) {
+    console.warn(`  Warning: navigation redirected to ${curUrl}. This may affect video scraping.`);
+  }
+
+  await page.waitForFunction(
+    (selector) => document.querySelectorAll(selector).length > 0,
+    profileVideoLinkSelector,
+    { timeout: 60000 },
+  );
 
   const urls = new Set();
   let lastHeight = 0;
@@ -138,12 +147,33 @@ async function changeVideoToPrivate(page, videoUrl) {
   }
 
   if (!actionClicked) {
-    console.warn('  Could not click any action selector. Searching for direct privacy dialog text.');
+    console.warn('  Could not click any action selector. Trying page-evaluation fallback.');
+    try {
+      const clicked = await page.evaluate(() => {
+        const patterns = [/more/i, /actions/i, /edit/i, /^\.+$/];
+        const candidates = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"]'));
+        for (const el of candidates) {
+          const text = (el.innerText || '').trim();
+          const label = (el.getAttribute('aria-label') || '').trim();
+          if (patterns.some((p) => p.test(text)) || patterns.some((p) => p.test(label))) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (clicked) {
+        actionClicked = true;
+        console.log('  Page-evaluation fallback clicked an action button.');
+      }
+    } catch (_) {
+      // ignore
+    }
   }
 
   await page.waitForTimeout(1500);
 
-  const popup = await page.evaluateHandle(() => {
+  const popupHandle = await page.evaluateHandle(() => {
     const dialogTexts = ['Privacy settings', 'Who can watch this video', 'Only you', 'Only me'];
     const elements = Array.from(document.querySelectorAll('div'));
     return elements.find((el) => {
@@ -152,7 +182,7 @@ async function changeVideoToPrivate(page, videoUrl) {
     }) || null;
   });
 
-  const popupVisible = popup && (await (await popup.getProperty('nodeType')).jsonValue()) === 1;
+  const popupVisible = await popupHandle.evaluate((node) => !!node && node.nodeType === 1);
 
   if (popupVisible) {
     console.log('  Found popup container by text content.');
@@ -176,7 +206,7 @@ async function changeVideoToPrivate(page, videoUrl) {
   if (popupVisible) {
     for (const selector of optionSelectors) {
       try {
-        const handle = await popup.$(selector);
+        const handle = await popupHandle.$(selector);
         if (handle) {
           console.log(`  Clicking privacy option inside popup: ${selector}`);
           await handle.click({ force: true });
@@ -203,6 +233,22 @@ async function changeVideoToPrivate(page, videoUrl) {
         // Continue
       }
     }
+  }
+
+  if (!selectedPrivate) {
+    console.warn('  Unable to find or click "Only you" / "Only me".');
+    console.warn(`    Current URL: ${page.url()}`);
+    console.warn(`    Page title: ${await page.title()}`);
+    try {
+      const snippet = await page.evaluate(() => {
+        const dialog = Array.from(document.querySelectorAll('div')).find((el) => /Privacy settings|Who can watch this video/i.test(el.innerText || ''));
+        return dialog ? dialog.innerText.slice(0, 300) : 'no matching dialog text found';
+      });
+      console.warn(`    Dialog snippet: ${snippet}`);
+    } catch (e) {
+      console.warn('    Could not extract dialog snippet.');
+    }
+    return false;
   }
 
   if (!selectedPrivate) {
